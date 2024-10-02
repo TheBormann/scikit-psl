@@ -6,7 +6,8 @@ from typing import Optional
 import numpy as np
 from joblib import Parallel, delayed
 
-from skpsl.estimators.probabilistic_scoring_system import ProbabilisticScoringSystem
+from .probabilistic_scoring_list import ProbabilisticScoringList
+from .probabilistic_scoring_system import ProbabilisticScoringSystem
 
 class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
     """
@@ -52,13 +53,13 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         self.feature_costs = feature_costs
 
     def fit(
-        self,
-        X,
-        y,
-        sample_weight=None,
-        predef_features: Optional[np.ndarray] = None,
-        predef_scores: Optional[np.ndarray] = None,
-        strict=True,
+    self,
+    X,
+    y,
+    sample_weight=None,
+    predef_features: Optional[np.ndarray] = None,
+    predef_scores: Optional[np.ndarray] = None,
+    strict=True,
     ) -> "CostSensitiveProbabilisticScoringList":
         """
         Fits a cost-sensitive probabilistic scoring list to the given data.
@@ -83,22 +84,18 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         if predef_scores and predef_features:
             assert len(predef_features) <= len(predef_scores)
 
-        predef_scores = defaultdict(lambda: list(self.score_set_)) | {
-            predef_features[i]: [s] for i, s in enumerate(predef_scores)
-        }
+        predef_scores_dict = defaultdict(lambda: list(self.score_set_))
+        predef_scores_dict.update({predef_features[i]: [s] for i, s in enumerate(predef_scores)})
 
         number_features = X.shape[1]
         remaining_features = set(range(number_features))
         self.stage_clfs = []
+        self._features = []       # Initialize features list
+        self._scores = []         # Initialize scores list
+        self._thresholds = []     # Initialize thresholds list
 
         # Initial expected entropy with no features
-        initial_clf = ProbabilisticScoringSystem(
-            features=[],
-            scores=[],
-            initial_feature_thresholds=[],
-            **self.stage_clf_params_,
-        ).fit(X, y)
-        initial_loss = initial_clf.score(X, y, sample_weight)
+        initial_loss = self._fit_and_store_clf_at_k(X, y, sample_weight, f=[], s=[], t=[])
         losses = [initial_loss]
         stage = 0
 
@@ -127,29 +124,35 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
             ]
 
             # Collect BCR values
-            bcr_values, f, s, t = zip(
-                *Parallel(n_jobs=self.n_jobs)(
-                    delayed(self._compute_bcr)(
-                        list(f_seq), list(s_seq), losses[-1], X, y, sample_weight
-                    )
-                    for (f_seq, s_seq) in chain.from_iterable(
-                        product([fext], product(*[predef_scores[f] for f in fext]))
-                        for fext in f_exts
-                    )
+            bcr_values_futures = Parallel(n_jobs=self.n_jobs)(
+                delayed(self._compute_bcr)(
+                    list(f_seq), list(s_seq), losses[-1], X, y, sample_weight
+                )
+                for (f_seq, s_seq) in chain.from_iterable(
+                    product([fext], product(*[predef_scores_dict[f] for f in fext]))
+                    for fext in f_exts
                 )
             )
+            bcr_values, f_list, s_list, t_list = zip(*bcr_values_futures)
 
             i = np.argmax(bcr_values)
-            remaining_features.remove(f[i])
+            selected_feature = f_list[i]
+            selected_score = s_list[i]
+            selected_threshold = t_list[i]
+
+            remaining_features.remove(selected_feature)
+            self._features.append(selected_feature)
+            self._scores.append(selected_score)
+            self._thresholds.append(selected_threshold)
 
             # Fit and store the classifier with the selected feature
             new_loss = self._fit_and_store_clf_at_k(
                 X,
                 y,
                 sample_weight,
-                self.features + [f[i]],
-                self.scores + [s[i]],
-                self.thresholds + [t[i]],
+                self._features.copy(),
+                self._scores.copy(),
+                self._thresholds.copy(),
             )
             losses.append(new_loss)
             stage += 1
@@ -158,10 +161,10 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
     def _compute_bcr(
         self, feature_extension, score_extension, current_loss, X, y, sample_weight
     ):
-        # feature set with the new feature(s)
-        new_features = self.features + feature_extension
-        new_scores = self.scores + score_extension
-        new_thresholds = self.thresholds + [None] * len(feature_extension)
+        # Feature set with the new feature(s)
+        new_features = self._features + feature_extension
+        new_scores = self._scores + score_extension
+        new_thresholds = self._thresholds + [None] * len(feature_extension)
 
         # Fit the classifier with the extended features
         clf = ProbabilisticScoringSystem(
@@ -187,7 +190,10 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         return bcr, feature_extension[0], score_extension[0], clf.feature_thresholds[-1]
 
     def _fit_and_store_clf_at_k(self, X, y, sample_weight=None, f=None, s=None, t=None):
-        f, s, t = f or [], s or [], t or []
+        f = f or []
+        s = s or []
+        t = t or []
+
         k_clf = ProbabilisticScoringSystem(
             features=f,
             scores=s,

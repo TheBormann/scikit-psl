@@ -1,1 +1,2 @@
 from skpsl.estimators import ProbabilisticScoringList
+from skpsl.estimators import CostSensitiveProbabilisticScoringList

@@ -1,4 +1,5 @@
-from .probabilistic_scoring_list import ProbabilisticScoringList
 from .probabilistic_scoring_system import ProbabilisticScoringSystem
+from .probabilistic_scoring_list import ProbabilisticScoringList
+from .cost_sensitive_probabilistic_scoring_system import CostSensitiveProbabilisticScoringList
 
-__all__ = ["ProbabilisticScoringSystem", "ProbabilisticScoringList"]
+__all__ = ["ProbabilisticScoringSystem", "ProbabilisticScoringList", "CostSensitiveProbabilisticScoringList"]

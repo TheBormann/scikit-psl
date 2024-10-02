@@ -53,3 +53,11 @@ print(df.to_string(index=False, na_rep="-", justify="center", float_format=lambd
   5      >2.4648  2.00    0.00    0.00   0.07   0.07   0.92   1.00   1.00   1.00 
 """
 ```
+
+# Runing Examples
+```bash
+export PYTHONPATH="/Users/lukasbormann/Documents/Git/scikit-psl:$PYTHONPATH";
+```
+```bash
+python examples/01_simple_example.py
+```
