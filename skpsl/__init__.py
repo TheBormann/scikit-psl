@@ -1,2 +1,2 @@
-from skpsl.estimators import ProbabilisticScoringList
-from skpsl.estimators import CostSensitiveProbabilisticScoringList
+from skpsl.estimators import ProbabilisticScoringList, CostSensitiveProbabilisticScoringList
+from skpsl.preprocessing import MinEntropyBinarizer

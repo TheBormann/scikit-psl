@@ -25,10 +25,9 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         stage_loss=None,
         cascade_loss=None,
         stage_clf_params=None,
-        feature_costs=None,
     ):
         """
-        Initializes the CostSensitiveProbabilisticScoringList with feature costs.
+        Initializes the CostSensitiveProbabilisticScoringList.
 
         :param score_set: Set of score values to be considered (feature weights).
         :param loss_cutoff: Minimal loss at which to stop fitting further stages. None means fitting all stages.
@@ -38,7 +37,6 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         :param stage_loss: Loss function used at each stage.
         :param cascade_loss: Loss function used to aggregate losses across stages.
         :param stage_clf_params: Additional parameters for the stage classifiers.
-        :param feature_costs: List or array containing the cost for each feature.
         """
         super().__init__(
             score_set=score_set,
@@ -50,22 +48,23 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
             cascade_loss=cascade_loss,
             stage_clf_params=stage_clf_params,
         )
-        self.feature_costs = feature_costs
 
     def fit(
-    self,
-    X,
-    y,
-    sample_weight=None,
-    predef_features: Optional[np.ndarray] = None,
-    predef_scores: Optional[np.ndarray] = None,
-    strict=True,
+        self,
+        X,
+        y,
+        sample_weight=None,
+        feature_costs=None,
+        predef_features: Optional[np.ndarray] = None,
+        predef_scores: Optional[np.ndarray] = None,
+        strict=True,
     ) -> "CostSensitiveProbabilisticScoringList":
         """
         Fits a cost-sensitive probabilistic scoring list to the given data.
 
         :param X: Feature matrix.
         :param y: Target vector.
+        :param feature_costs: List or array containing the cost for each feature.
         :param predef_features: Predefined features to include.
         :param predef_scores: Predefined scores corresponding to the predefined features.
         :param strict: Whether to strictly use the predefined features.
@@ -75,10 +74,11 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         predef_features = predef_features or []
         predef_scores = predef_scores or []
 
-        if self.feature_costs is None:
+        if feature_costs is None:
             raise ValueError("Feature costs must be provided.")
-        if len(self.feature_costs) != X.shape[1]:
+        if len(feature_costs) != X.shape[1]:
             raise ValueError("Length of feature_costs must equal number of features.")
+        self.feature_costs = np.array(feature_costs)
 
         self.classes_ = np.unique(y)
         if predef_scores and predef_features:
@@ -90,9 +90,9 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         number_features = X.shape[1]
         remaining_features = set(range(number_features))
         self.stage_clfs = []
-        self._features = []       # Initialize features list
-        self._scores = []         # Initialize scores list
-        self._thresholds = []     # Initialize thresholds list
+        self._features = [] 
+        self._scores = []  
+        self._thresholds = [] 
 
         # Initial expected entropy with no features
         initial_loss = self._fit_and_store_clf_at_k(X, y, sample_weight, f=[], s=[], t=[])
@@ -179,7 +179,7 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         delta_loss = current_loss - new_loss
 
         # Compute the cost of the new feature(s)
-        feature_cost = np.sum(np.array(self.feature_costs)[feature_extension])
+        feature_cost = np.sum(self.feature_costs[feature_extension])
         
         if feature_cost == 0:
             bcr = np.inf if delta_loss > 0 else 0

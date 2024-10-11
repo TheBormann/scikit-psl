@@ -11,11 +11,10 @@ if __name__ == '__main__':
     feature_costs = np.random.rand(X.shape[1])
 
     clf = CostSensitiveProbabilisticScoringList(
-        score_set={-1, 1, 2},
-        feature_costs=feature_costs,
+        score_set={-1, 1, 2}
     )
     
-    clf.fit(X_train, y_train)
+    clf.fit(X_train, y_train, feature_costs=feature_costs)
 
     brier_score = clf.score(X_test, y_test)
     print(f"Brier score: {brier_score:.4f}")
