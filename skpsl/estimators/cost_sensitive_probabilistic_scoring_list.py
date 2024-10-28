@@ -12,7 +12,7 @@ from .probabilistic_scoring_system import ProbabilisticScoringSystem
 class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
     """
     Cost-sensitive probabilistic scoring list classifier.
-    Implements the greedy algorithm using Benefit-Cost Ratio (BCR).
+    Implements both greedy and Pareto front approaches for feature selection.
     """
 
     def __init__(
@@ -20,7 +20,9 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         score_set: set,
         loss_cutoff: float = None,
         method="bisect",
-        lookahead=1,
+        selection_method="greedy",
+        lookahead=1, # For greedy method
+        max_iterations=10,  # For Pareto front method
         n_jobs=None,
         stage_loss=None,
         cascade_loss=None,
@@ -32,7 +34,9 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         :param score_set: Set of score values to be considered (feature weights).
         :param loss_cutoff: Minimal loss at which to stop fitting further stages. None means fitting all stages.
         :param method: Optimization method for threshold optimization.
-        :param lookahead: Number of features to look ahead when selecting the next feature.
+        :param selection_method: Feature selection method ('greedy' or 'pareto').
+        :param lookahead: Number of features to look ahead when selecting the next feature (used in greedy method).
+        :param max_iterations: Maximum number of iterations for the Pareto front algorithm.
         :param n_jobs: Number of parallel jobs for computation.
         :param stage_loss: Loss function used at each stage.
         :param cascade_loss: Loss function used to aggregate losses across stages.
@@ -48,6 +52,9 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
             cascade_loss=cascade_loss,
             stage_clf_params=stage_clf_params,
         )
+        self.selection_method = selection_method
+        self.max_iterations = max_iterations
+        self.pareto_front = []
 
     def fit(
         self,
@@ -60,7 +67,7 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         strict=True,
     ) -> "CostSensitiveProbabilisticScoringList":
         """
-        Fits a cost-sensitive probabilistic scoring list to the given data.
+        Fits a cost-sensitive probabilistic scoring list to the given data using the specified selection method.
 
         :param X: Feature matrix.
         :param y: Target vector.
@@ -69,6 +76,30 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         :param predef_scores: Predefined scores corresponding to the predefined features.
         :param strict: Whether to strictly use the predefined features.
         :return: The fitted classifier.
+        """
+        if self.selection_method == 'greedy':
+            return self._fit_greedy(
+                X, y, sample_weight, feature_costs, predef_features, predef_scores, strict
+            )
+        elif self.selection_method == 'pareto':
+            return self._fit_pareto(
+                X, y, sample_weight, feature_costs, predef_features, predef_scores, strict
+            )
+        else:
+            raise ValueError(f"Unknown selection_method '{self.selection_method}'. Use 'greedy' or 'pareto'.")
+
+    def _fit_greedy(
+        self,
+        X,
+        y,
+        sample_weight,
+        feature_costs,
+        predef_features,
+        predef_scores,
+        strict,
+    ):
+        """
+        Fits the classifier using the greedy algorithm.
         """
         X, y = np.array(X), np.array(y)
         predef_features = predef_features or []
@@ -90,11 +121,11 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         number_features = X.shape[1]
         remaining_features = set(range(number_features))
         self.stage_clfs = []
-        self._features = [] 
-        self._scores = []  
-        self._thresholds = [] 
+        self._features = []
+        self._scores = []
+        self._thresholds = []
 
-        # Initial expected entropy with no features
+        # Initial expected loss with no features
         initial_loss = self._fit_and_store_clf_at_k(X, y, sample_weight, f=[], s=[], t=[])
         losses = [initial_loss]
         stage = 0
@@ -175,12 +206,12 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         ).fit(X, y)
         new_loss = clf.score(X, y, sample_weight)
 
-        # Compute the expected entropy reduction
+        # Compute the expected loss reduction
         delta_loss = current_loss - new_loss
 
         # Compute the cost of the new feature(s)
         feature_cost = np.sum(self.feature_costs[feature_extension])
-        
+
         if feature_cost == 0:
             bcr = np.inf if delta_loss > 0 else 0
         else:
@@ -202,3 +233,165 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         ).fit(X, y)
         self.stage_clfs.append(k_clf)
         return k_clf.score(X, y, sample_weight)
+
+    def _fit_pareto(
+        self,
+        X,
+        y,
+        sample_weight,
+        feature_costs,
+        predef_features,
+        predef_scores,
+        strict,
+    ):
+        """
+        Fits the classifier using the Pareto front approach.
+        """
+        X, y = np.array(X), np.array(y)
+        predef_features = predef_features or []
+        predef_scores = predef_scores or []
+
+        if feature_costs is None:
+            raise ValueError("Feature costs must be provided.")
+        if len(feature_costs) != X.shape[1]:
+            raise ValueError("Length of feature_costs must equal number of features.")
+        self.feature_costs = np.array(feature_costs)
+
+        self.classes_ = np.unique(y)
+        if predef_scores and predef_features:
+            assert len(predef_features) <= len(predef_scores)
+
+        predef_scores_dict = defaultdict(lambda: list(self.score_set_))
+        predef_scores_dict.update({predef_features[i]: [s] for i, s in enumerate(predef_scores)})
+
+        number_features = X.shape[1]
+        all_features = set(range(number_features))
+        remaining_features = all_features.copy()
+
+        self.stage_clfs = []
+        self._features = []  # Final selected features
+        self._scores = []    # Final selected scores
+        self._thresholds = []  # Final selected thresholds
+
+        # Initialize Pareto front with an empty solution
+        initial_loss = self._compute_loss([], [], X, y, sample_weight)
+        initial_solution = {
+            'features': [],
+            'scores': [],
+            'thresholds': [],
+            'loss': initial_loss,
+            'cost': 0.0
+        }
+        self.pareto_front = [initial_solution]
+        iteration = 0
+
+        while iteration < self.max_iterations and remaining_features:
+            new_solutions = []
+            for solution in self.pareto_front:
+                current_features = solution['features']
+                current_scores = solution['scores']
+                current_thresholds = solution['thresholds']
+                used_features = set(current_features)
+                available_features = remaining_features - used_features
+
+                # Consider adding each available feature
+                for feature in available_features:
+                    possible_scores = predef_scores_dict.get(feature, list(self.score_set_))
+                    for score in possible_scores:
+                        new_features = current_features + [feature]
+                        new_scores = current_scores + [score]
+                        new_thresholds = current_thresholds + [None]  # Threshold to be optimized
+
+                        # Compute loss and cost
+                        loss = self._compute_loss(new_features, new_scores, X, y, sample_weight)
+                        cost = solution['cost'] + self.feature_costs[feature]
+
+                        new_solution = {
+                            'features': new_features,
+                            'scores': new_scores,
+                            'thresholds': new_thresholds,
+                            'loss': loss,
+                            'cost': cost
+                        }
+                        new_solutions.append(new_solution)
+
+            # Update Pareto front
+            combined_solutions = self.pareto_front + new_solutions
+            self.pareto_front = self._compute_pareto_front(combined_solutions)
+
+            # Remove features that have been used in all Pareto front solutions
+            used_features = set(chain.from_iterable(sol['features'] for sol in self.pareto_front))
+            remaining_features = all_features - used_features
+
+            # Check if loss cutoff has been reached
+            min_loss = min(sol['loss'] for sol in self.pareto_front)
+            if self.loss_cutoff is not None and min_loss <= self.loss_cutoff:
+                break
+
+            iteration += 1
+
+        # Select the best solution from Pareto front (e.g., minimal loss)
+        best_solution = min(self.pareto_front, key=lambda s: s['loss'])
+        self._features = best_solution['features']
+        self._scores = best_solution['scores']
+        self._thresholds = best_solution['thresholds']
+
+        # Fit and store the final classifier
+        final_clf = ProbabilisticScoringSystem(
+            features=self._features,
+            scores=self._scores,
+            initial_feature_thresholds=self._thresholds,
+            **self.stage_clf_params_,
+        ).fit(X, y)
+        self.stage_clfs.append(final_clf)
+
+        return self
+
+    def _compute_loss(self, features, scores, X, y, sample_weight):
+        """
+        Computes the loss for a given set of features and scores.
+
+        :param features: List of feature indices.
+        :param scores: List of corresponding scores.
+        :param X: Feature matrix.
+        :param y: Target vector.
+        :param sample_weight: Sample weights.
+        :return: Computed loss.
+        """
+        if not features:
+            # Return initial loss (e.g., entropy without any features)
+            if self.stage_loss is not None:
+                return self.stage_loss(y, sample_weight)
+            else:
+                # Default to negative log-likelihood if no stage_loss is provided
+                from sklearn.metrics import log_loss
+                return log_loss(y, np.full_like(y, 1 / len(self.classes_)), sample_weight=sample_weight)
+        clf = ProbabilisticScoringSystem(
+            features=features,
+            scores=scores,
+            initial_feature_thresholds=[None]*len(features),
+            **self.stage_clf_params_,
+        ).fit(X, y)
+        loss = clf.score(X, y, sample_weight)
+        return loss
+
+    def _compute_pareto_front(self, solutions):
+        """
+        Computes the Pareto front from a list of solutions.
+
+        :param solutions: List of solution dictionaries.
+        :return: List of non-dominated solutions (Pareto front).
+        """
+        # Sort solutions by loss (ascending) and cost (ascending)
+        solutions = sorted(solutions, key=lambda s: (s['loss'], s['cost']))
+        pareto_front = []
+        for solution in solutions:
+            is_dominated = False
+            for pareto_solution in pareto_front:
+                if (pareto_solution['loss'] <= solution['loss'] and
+                        pareto_solution['cost'] <= solution['cost']):
+                    is_dominated = True
+                    break
+            if not is_dominated:
+                pareto_front.append(solution)
+        return pareto_front
