@@ -2,6 +2,7 @@ import logging
 from collections import defaultdict
 from itertools import permutations, product, chain
 from typing import Optional
+from sklearn.metrics import log_loss
 
 import numpy as np
 from joblib import Parallel, delayed
@@ -246,6 +247,15 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
     ):
         """
         Fits the classifier using the Pareto front approach.
+
+        :param X: Feature matrix.
+        :param y: Target vector.
+        :param sample_weight: Sample weights.
+        :param feature_costs: List or array containing the cost for each feature.
+        :param predef_features: Predefined features to include.
+        :param predef_scores: Predefined scores corresponding to the predefined features.
+        :param strict: Whether to strictly use the predefined features.
+        :return: The Pareto front, a list of non-dominated solutions.
         """
         X, y = np.array(X), np.array(y)
         predef_features = predef_features or []
@@ -267,11 +277,6 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         number_features = X.shape[1]
         all_features = set(range(number_features))
         remaining_features = all_features.copy()
-
-        self.stage_clfs = []
-        self._features = []  # Final selected features
-        self._scores = []    # Final selected scores
-        self._thresholds = []  # Final selected thresholds
 
         # Initialize Pareto front with an empty solution
         initial_loss = self._compute_loss([], [], X, y, sample_weight)
@@ -319,9 +324,13 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
             combined_solutions = self.pareto_front + new_solutions
             self.pareto_front = self._compute_pareto_front(combined_solutions)
 
-            # Remove features that have been used in all Pareto front solutions
-            used_features = set(chain.from_iterable(sol['features'] for sol in self.pareto_front))
-            remaining_features = all_features - used_features
+            # Identify remaining features
+            if self.pareto_front:
+                features_in_solutions = [set(sol['features']) for sol in self.pareto_front]
+                used_features = set.union(*features_in_solutions)
+                remaining_features = all_features - used_features
+            else:
+                remaining_features = all_features.copy()
 
             # Check if loss cutoff has been reached
             min_loss = min(sol['loss'] for sol in self.pareto_front)
@@ -330,22 +339,20 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
 
             iteration += 1
 
-        # Select the best solution from Pareto front (e.g., minimal loss)
-        best_solution = min(self.pareto_front, key=lambda s: s['loss'])
-        self._features = best_solution['features']
-        self._scores = best_solution['scores']
-        self._thresholds = best_solution['thresholds']
+        # Fit and store classifiers for each solution in the Pareto front
+        self.pareto_classifiers = []
+        for solution in self.pareto_front:
+            clf = ProbabilisticScoringSystem(
+                features=solution['features'],
+                scores=solution['scores'],
+                initial_feature_thresholds=solution['thresholds'],
+                **self.stage_clf_params_,
+            ).fit(X, y)
+            self.pareto_classifiers.append(clf)
+            # Store the classifier in the solution
+            solution['classifier'] = clf
 
-        # Fit and store the final classifier
-        final_clf = ProbabilisticScoringSystem(
-            features=self._features,
-            scores=self._scores,
-            initial_feature_thresholds=self._thresholds,
-            **self.stage_clf_params_,
-        ).fit(X, y)
-        self.stage_clfs.append(final_clf)
-
-        return self
+        return self.pareto_front
 
     def _compute_loss(self, features, scores, X, y, sample_weight):
         """
@@ -358,14 +365,6 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         :param sample_weight: Sample weights.
         :return: Computed loss.
         """
-        if not features:
-            # Return initial loss (e.g., entropy without any features)
-            if self.stage_loss is not None:
-                return self.stage_loss(y, sample_weight)
-            else:
-                # Default to negative log-likelihood if no stage_loss is provided
-                from sklearn.metrics import log_loss
-                return log_loss(y, np.full_like(y, 1 / len(self.classes_)), sample_weight=sample_weight)
         clf = ProbabilisticScoringSystem(
             features=features,
             scores=scores,
@@ -382,16 +381,24 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         :param solutions: List of solution dictionaries.
         :return: List of non-dominated solutions (Pareto front).
         """
-        # Sort solutions by loss (ascending) and cost (ascending)
-        solutions = sorted(solutions, key=lambda s: (s['loss'], s['cost']))
         pareto_front = []
-        for solution in solutions:
+
+        for s in solutions:
+            # Remove any solutions in pareto_front that are dominated by s
+            pareto_front = [p for p in pareto_front if not (
+                (s['loss'] <= p['loss'] and s['cost'] <= p['cost']) and
+                (s['loss'] < p['loss'] or s['cost'] < p['cost'])
+            )]
+
+            # Check if s is dominated by any solution in pareto_front
             is_dominated = False
-            for pareto_solution in pareto_front:
-                if (pareto_solution['loss'] <= solution['loss'] and
-                        pareto_solution['cost'] <= solution['cost']):
+            for p in pareto_front:
+                if (p['loss'] <= s['loss'] and p['cost'] <= s['cost']) and \
+                (p['loss'] < s['loss'] or p['cost'] < s['cost']):
                     is_dominated = True
                     break
+
             if not is_dominated:
-                pareto_front.append(solution)
+                pareto_front.append(s)
+
         return pareto_front
