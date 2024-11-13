@@ -276,7 +276,6 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
 
         number_features = X.shape[1]
         all_features = set(range(number_features))
-        remaining_features = all_features.copy()
 
         # Initialize Pareto front with an empty solution
         initial_loss = self._compute_loss([], [], X, y, sample_weight)
@@ -290,22 +289,33 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         self.pareto_front = [initial_solution]
         iteration = 0
 
-        while iteration < self.max_iterations and remaining_features:
+        # Maintain a set of unique solution keys
+        unique_solution_keys = set()
+
+        while iteration < self.max_iterations:
             new_solutions = []
             for solution in self.pareto_front:
                 current_features = solution['features']
                 current_scores = solution['scores']
                 current_thresholds = solution['thresholds']
-                used_features = set(current_features)
-                available_features = remaining_features - used_features
+                used_features_in_solution = set(current_features)
+                available_features = all_features - used_features_in_solution  # Exclude features already in the solution
 
-                # Consider adding each available feature
+                # Consider adding each available feature to the current solution
                 for feature in available_features:
                     possible_scores = predef_scores_dict.get(feature, list(self.score_set_))
                     for score in possible_scores:
                         new_features = current_features + [feature]
                         new_scores = current_scores + [score]
                         new_thresholds = current_thresholds + [None]  # Threshold to be optimized
+
+                        # Create a unique key for the solution
+                        solution_key = (tuple(sorted(new_features)), tuple(new_scores))
+
+                        # Check for duplicates
+                        if solution_key in unique_solution_keys:
+                            continue  # Skip this solution as it's a duplicate
+                        unique_solution_keys.add(solution_key)
 
                         # Compute loss and cost
                         loss = self._compute_loss(new_features, new_scores, X, y, sample_weight)
@@ -323,14 +333,6 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
             # Update Pareto front
             combined_solutions = self.pareto_front + new_solutions
             self.pareto_front = self._compute_pareto_front(combined_solutions)
-
-            # Identify remaining features
-            if self.pareto_front:
-                features_in_solutions = [set(sol['features']) for sol in self.pareto_front]
-                used_features = set.union(*features_in_solutions)
-                remaining_features = all_features - used_features
-            else:
-                remaining_features = all_features.copy()
 
             # Check if loss cutoff has been reached
             min_loss = min(sol['loss'] for sol in self.pareto_front)
@@ -352,7 +354,7 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
             # Store the classifier in the solution
             solution['classifier'] = clf
 
-        return self.pareto_front
+        return self
 
     def _compute_loss(self, features, scores, X, y, sample_weight):
         """
@@ -375,30 +377,17 @@ class CostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         return loss
 
     def _compute_pareto_front(self, solutions):
-        """
-        Computes the Pareto front from a list of solutions.
-
-        :param solutions: List of solution dictionaries.
-        :return: List of non-dominated solutions (Pareto front).
-        """
         pareto_front = []
-
         for s in solutions:
-            # Remove any solutions in pareto_front that are dominated by s
-            pareto_front = [p for p in pareto_front if not (
-                (s['loss'] <= p['loss'] and s['cost'] <= p['cost']) and
-                (s['loss'] < p['loss'] or s['cost'] < p['cost'])
-            )]
-
-            # Check if s is dominated by any solution in pareto_front
-            is_dominated = False
-            for p in pareto_front:
-                if (p['loss'] <= s['loss'] and p['cost'] <= s['cost']) and \
-                (p['loss'] < s['loss'] or p['cost'] < s['cost']):
-                    is_dominated = True
+            dominated = False
+            for other_s in solutions:
+                if other_s == s:
+                    continue
+                if (other_s['loss'] <= s['loss'] and other_s['cost'] <= s['cost']) and \
+                (other_s['loss'] < s['loss'] or other_s['cost'] < s['cost']):
+                    # s is dominated by other_s
+                    dominated = True
                     break
-
-            if not is_dominated:
+            if not dominated:
                 pareto_front.append(s)
-
         return pareto_front
