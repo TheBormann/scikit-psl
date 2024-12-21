@@ -28,7 +28,7 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         mutation_prob: float = 0.2,
         n_jobs: Optional[int] = None,
         stage_clf_params: Optional[dict] = None,
-        selection_method = 'pareto'
+        selection_method='pareto'
     ):
         """
         Initializes the EvolutionCostSensitiveProbabilisticScoringList.
@@ -41,6 +41,7 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         :param mutation_prob: Probability of performing mutation.
         :param n_jobs: Number of parallel jobs for computation.
         :param stage_clf_params: Additional parameters for the stage classifiers.
+        :param selection_method: Method for selection ('pareto' or 'custom').
         """
         super().__init__(
             score_set=score_set,
@@ -105,7 +106,7 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
 
         toolbox = base.Toolbox()
 
-        # Attribute generator: each feature is either selected (1) or not (0)
+        # Each feature is either selected (1) or not (0)
         toolbox.register("attr_bool", np.random.randint, 0, 2)
 
         # Structure initializers
@@ -141,6 +142,9 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         # Initialize population
         population = toolbox.population(n=self.population_size)
 
+        # Initialize Pareto Front Hall of Fame
+        pareto_front_hof = tools.ParetoFront()
+
         # Statistics (optional)
         stats = tools.Statistics(lambda ind: ind.fitness.values)
         stats.register("avg_loss", lambda fits: np.mean([f[0] for f in fits]))
@@ -148,7 +152,7 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         stats.register("min_loss", lambda fits: np.min([f[0] for f in fits]))
         stats.register("min_cost", lambda fits: np.min([f[1] for f in fits]))
 
-        # Evolutionary algorithm
+        # Evolutionary algorithm with Pareto Front Hall of Fame
         try:
             population, logbook = algorithms.eaMuPlusLambda(
                 population,
@@ -159,7 +163,7 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
                 mutpb=self.mutation_prob,
                 ngen=self.generations,
                 stats=stats,
-                halloffame=None,
+                halloffame=pareto_front_hof,  # Use ParetoFront Hall of Fame
                 verbose=True
             )
         except ValueError as ve:
@@ -169,11 +173,38 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
                 raise ve
 
         # Extract Pareto front
-        pareto_front = tools.sortNondominated(population, k=len(population), first_front_only=True)[0]
+        if self.selection_method == 'pareto':
+            self.pareto_front = self._extract_pareto_front_hof(pareto_front_hof, X, y)
+        elif self.selection_method == 'custom':
+            # Convert population to solution dicts
+            solutions = self._convert_population_to_solutions(population, X, y)
+            # Compute Pareto front using the existing function
+            self.pareto_front = self._compute_pareto_front(solutions)
+        else:
+            raise ValueError(f"Unknown selection method: {self.selection_method}. Choose 'pareto' or 'custom'.")
 
-        # Convert Pareto front to solutions
-        self.pareto_front = []
-        for ind in pareto_front:
+        # Cleanup DEAP creators to avoid conflicts in future runs
+        if hasattr(creator, "FitnessMin"):
+            del creator.FitnessMin
+        if hasattr(creator, "Individual"):
+            del creator.Individual
+
+        if self.n_jobs and self.n_jobs > 1:
+            pool.close()
+
+        return self
+
+    def _extract_pareto_front_hof(self, pareto_front_hof, X, y):
+        """
+        Converts the DEAP ParetoFront Hall of Fame into the internal Pareto front representation.
+
+        :param pareto_front_hof: DEAP ParetoFront object.
+        :param X: Feature matrix.
+        :param y: Target vector.
+        :return: List of non-dominated solutions.
+        """
+        pareto_front = []
+        for ind in pareto_front_hof:
             selected_features = [i for i, bit in enumerate(ind) if bit == 1]
             if self._strict and self._predef_features is not None:
                 selected_features = list(set(selected_features) | set(self._predef_features))
@@ -209,18 +240,78 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
                 'cost': cost,
                 'classifier': clf
             }
-            self.pareto_front.append(solution)
+            pareto_front.append(solution)
+        return pareto_front
 
-        # Cleanup DEAP creators to avoid conflicts in future runs
-        if hasattr(creator, "FitnessMin"):
-            del creator.FitnessMin
-        if hasattr(creator, "Individual"):
-            del creator.Individual
+    def _convert_population_to_solutions(self, population, X, y):
+        """
+        Converts a DEAP population into a list of solution dictionaries.
 
-        if self.n_jobs and self.n_jobs > 1:
-            pool.close()
-            
-        return self
+        :param population: DEAP population.
+        :param X: Feature matrix.
+        :param y: Target vector.
+        :return: List of solution dictionaries.
+        """
+        solutions = []
+        for ind in population:
+            selected_features = [i for i, bit in enumerate(ind) if bit == 1]
+            if self._strict and self._predef_features is not None:
+                selected_features = list(set(selected_features) | set(self._predef_features))
+
+            # Assign scores
+            selected_scores = []
+            for feat in selected_features:
+                if self._predef_scores is not None and self._predef_features is not None and feat in self._predef_features:
+                    idx = list(self._predef_features).index(feat)
+                    selected_scores.append(self._predef_scores[idx])
+                else:
+                    if len(self.score_set_) == 0:
+                        raise ValueError("Score set is empty during Pareto front processing.")
+                    selected_scores.append(np.random.choice(list(self.score_set_)))
+
+            # Fit classifier
+            clf = ProbabilisticScoringSystem(
+                features=selected_features,
+                scores=selected_scores,
+                initial_feature_thresholds=[None] * len(selected_features),
+                **self.stage_clf_params_,
+            ).fit(X, y)
+            loss = clf.score(X, y)
+            cost = self.feature_costs[selected_features].sum()
+
+            solution = {
+                'features': selected_features,
+                'scores': selected_scores,
+                'thresholds': clf.feature_thresholds,
+                'loss': loss,
+                'cost': cost,
+                'classifier': clf
+            }
+            solutions.append(solution)
+        return solutions
+
+    def _compute_pareto_front(self, solutions):
+        """
+        Computes the Pareto front from a list of solutions using non-dominated sorting.
+
+        :param solutions: List of solution dictionaries.
+        :return: List of non-dominated solutions.
+        """
+        pareto_front = []
+        for s in solutions:
+            dominated = False
+            for other_s in solutions:
+                if other_s == s:
+                    continue
+                if (other_s['loss'] <= s['loss'] and other_s['cost'] <= s['cost']) and \
+                   (other_s['loss'] < s['loss'] or other_s['cost'] < s['cost']):
+                    # s is dominated by other_s
+                    dominated = True
+                    break
+            if not dominated:
+                pareto_front.append(s)
+        return pareto_front
+
 
 def eval_individual(
     individual,
