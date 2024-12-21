@@ -86,8 +86,9 @@ class ProbabilisticScoringList(BaseEstimator, ClassifierMixin):
         if predef_scores and predef_features:
             assert len(predef_features) <= len(predef_scores)
 
+        predef_len = min(len(predef_features), len(predef_scores))
         predef_scores = defaultdict(lambda: list(self.score_set_)) | {
-            predef_features[i]: [s] for i, s in enumerate(predef_scores)
+            predef_features[i]: [predef_scores[i]] for i in range(predef_len)
         }
 
         number_features = X.shape[1]
