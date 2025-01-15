@@ -12,6 +12,60 @@ from .probabilistic_scoring_list import ProbabilisticScoringList
 from .probabilistic_scoring_system import ProbabilisticScoringSystem
 
 
+def eval_individual(
+    individual,
+    X,
+    y,
+    feature_costs,
+    predef_features,
+    predef_scores,
+    strict,
+    score_set,
+    stage_clf_params,
+):
+    """
+    Evaluates an individual in the evolutionary algorithm. 
+    Now we store the selected features, chosen scores, cost, loss, 
+    and even the fitted classifier so we don't have to refit later.
+    """
+    selected_features = [i for i, bit in enumerate(individual) if bit == 1]
+    if strict and predef_features is not None:
+        selected_features = list(set(selected_features) | set(predef_features))
+
+    # Assign scores exactly once
+    selected_scores = []
+    for feat in selected_features:
+        if (predef_scores is not None 
+            and predef_features is not None 
+            and feat in predef_features):
+            idx = list(predef_features).index(feat)
+            selected_scores.append(predef_scores[idx])
+        else:
+            if len(score_set) == 0:
+                raise ValueError("Score set is empty during evaluation.")
+            selected_scores.append(np.random.choice(list(score_set)))
+
+    # Fit classifier exactly once
+    clf = ProbabilisticScoringSystem(
+        features=selected_features,
+        scores=selected_scores,
+        initial_feature_thresholds=[None] * len(selected_features),
+        **stage_clf_params,
+    ).fit(X, y)
+    loss = clf.score(X, y)
+    cost = feature_costs[selected_features].sum()
+
+    # Store everything in the individual so we can retrieve it later
+    individual.selected_features_ = selected_features
+    individual.selected_scores_ = selected_scores
+    individual.loss_ = loss
+    individual.cost_ = cost
+    individual.classifier_ = clf  # optional but handy
+
+    # Return the fitness
+    return loss, cost
+
+
 class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
     """
     Evolutionary algorithm-based cost-sensitive probabilistic scoring list classifier.
@@ -32,16 +86,6 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
     ):
         """
         Initializes the EvolutionCostSensitiveProbabilisticScoringList.
-
-        :param score_set: Set of score values to be considered (feature weights).
-        :param method: Optimization method for threshold optimization.
-        :param population_size: Number of individuals in the population.
-        :param generations: Number of generations to evolve.
-        :param crossover_prob: Probability of performing crossover.
-        :param mutation_prob: Probability of performing mutation.
-        :param n_jobs: Number of parallel jobs for computation.
-        :param stage_clf_params: Additional parameters for the stage classifiers.
-        :param selection_method: Method for selection ('pareto' or 'custom').
         """
         super().__init__(
             score_set=score_set,
@@ -69,15 +113,7 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         strict: bool = True,
     ) -> "EvolutionCostSensitiveProbabilisticScoringList":
         """
-        Fits a cost-sensitive probabilistic scoring list to the given data using an evolutionary algorithm.
-
-        :param X: Feature matrix.
-        :param y: Target vector.
-        :param feature_costs: Array containing the cost for each feature.
-        :param predef_features: Predefined features to include.
-        :param predef_scores: Predefined scores corresponding to the predefined features.
-        :param strict: Whether to strictly use the predefined features.
-        :return: The fitted classifier.
+        Fits a cost-sensitive probabilistic scoring list using NSGA-II.
         """
         # Validate feature costs
         if feature_costs is None:
@@ -93,27 +129,22 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
 
         num_features = X.shape[1]
 
-        # Store parameters for later use
         self._predef_features = predef_features
         self._predef_scores = predef_scores
         self._strict = strict
 
-        # Setup DEAP framework
+        # Setup DEAP
         if not hasattr(creator, "FitnessMin"):
-            creator.create("FitnessMin", base.Fitness, weights=(-1.0, -1.0))  # Minimize loss and cost
+            creator.create("FitnessMin", base.Fitness, weights=(-1.0, -1.0))
         if not hasattr(creator, "Individual"):
             creator.create("Individual", list, fitness=creator.FitnessMin)
 
         toolbox = base.Toolbox()
-
-        # Each feature is either selected (1) or not (0)
         toolbox.register("attr_bool", np.random.randint, 0, 2)
-
-        # Structure initializers
         toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_bool, n=num_features)
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-        # Evaluation function
+        # IMPORTANT: We use the improved eval_individual that stores results
         toolbox.register(
             "evaluate",
             partial(
@@ -132,7 +163,7 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         toolbox.register("mutate", tools.mutFlipBit, indpb=0.05)
         toolbox.register("select", tools.selNSGA2)
 
-        # Parallel evaluation
+        # Parallel if needed
         if self.n_jobs and self.n_jobs > 1:
             pool = Pool(self.n_jobs)
             toolbox.register("map", pool.map)
@@ -152,7 +183,6 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
         stats.register("min_loss", lambda fits: np.min([f[0] for f in fits]))
         stats.register("min_cost", lambda fits: np.min([f[1] for f in fits]))
 
-        # Evolutionary algorithm with Pareto Front Hall of Fame
         try:
             population, logbook = algorithms.eaMuPlusLambda(
                 population,
@@ -163,27 +193,28 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
                 mutpb=self.mutation_prob,
                 ngen=self.generations,
                 stats=stats,
-                halloffame=pareto_front_hof,  # Use ParetoFront Hall of Fame
+                halloffame=pareto_front_hof,
                 verbose=True
             )
         except ValueError as ve:
             if 'a' in str(ve) and "cannot be empty" in str(ve):
-                raise ValueError(f"Encountered ValueError during evolutionary algorithm: {ve}. Ensure 'score_set' is not empty.")
+                raise ValueError(
+                    f"Encountered ValueError during evolutionary algorithm: {ve}. "
+                    "Ensure 'score_set' is not empty."
+                )
             else:
                 raise ve
 
         # Extract Pareto front
         if self.selection_method == 'pareto':
-            self.pareto_front = self._extract_pareto_front_hof(pareto_front_hof, X, y)
+            self.pareto_front = self._extract_pareto_front_hof(pareto_front_hof)
         elif self.selection_method == 'custom':
-            # Convert population to solution dicts
-            solutions = self._convert_population_to_solutions(population, X, y)
-            # Compute Pareto front using the existing function
+            solutions = self._convert_population_to_solutions(population)
             self.pareto_front = self._compute_pareto_front(solutions)
         else:
             raise ValueError(f"Unknown selection method: {self.selection_method}. Choose 'pareto' or 'custom'.")
 
-        # Cleanup DEAP creators to avoid conflicts in future runs
+        # Cleanup DEAP
         if hasattr(creator, "FitnessMin"):
             del creator.FitnessMin
         if hasattr(creator, "Individual"):
@@ -194,44 +225,22 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
 
         return self
 
-    def _extract_pareto_front_hof(self, pareto_front_hof, X, y):
+    def _extract_pareto_front_hof(self, pareto_front_hof):
         """
         Converts the DEAP ParetoFront Hall of Fame into the internal Pareto front representation.
-
-        :param pareto_front_hof: DEAP ParetoFront object.
-        :param X: Feature matrix.
-        :param y: Target vector.
-        :return: List of non-dominated solutions.
+        Now we do NOT re-fit or re-randomize. 
+        We simply read what's already stored on the individuals.
         """
         pareto_front = []
         for ind in pareto_front_hof:
-            selected_features = [i for i, bit in enumerate(ind) if bit == 1]
-            if self._strict and self._predef_features is not None:
-                selected_features = list(set(selected_features) | set(self._predef_features))
+            # Reuse from the individual's stored properties:
+            selected_features = ind.selected_features_
+            selected_scores = ind.selected_scores_
+            loss = ind.loss_
+            cost = ind.cost_
+            clf = ind.classifier_
 
-            # Assign scores
-            selected_scores = []
-            for feat in selected_features:
-                if (self._predef_scores is not None and 
-                    self._predef_features is not None and 
-                    feat in self._predef_features):
-                    idx = list(self._predef_features).index(feat)
-                    selected_scores.append(self._predef_scores[idx])
-                else:
-                    if len(self.score_set_) == 0:
-                        raise ValueError("Score set is empty during Pareto front processing.")
-                    selected_scores.append(np.random.choice(list(self.score_set_)))
-
-            # Fit classifier
-            clf = ProbabilisticScoringSystem(
-                features=selected_features,
-                scores=selected_scores,
-                initial_feature_thresholds=[None] * len(selected_features),
-                **self.stage_clf_params_,
-            ).fit(X, y)
-            loss = clf.score(X, y)
-            cost = self.feature_costs[selected_features].sum()
-
+            # Build the solution dictionary
             solution = {
                 'features': selected_features,
                 'scores': selected_scores,
@@ -243,41 +252,18 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
             pareto_front.append(solution)
         return pareto_front
 
-    def _convert_population_to_solutions(self, population, X, y):
+    def _convert_population_to_solutions(self, population):
         """
-        Converts a DEAP population into a list of solution dictionaries.
-
-        :param population: DEAP population.
-        :param X: Feature matrix.
-        :param y: Target vector.
-        :return: List of solution dictionaries.
+        Converts a DEAP population into a list of solution dictionaries
+        using the stored values on each individual.
         """
         solutions = []
         for ind in population:
-            selected_features = [i for i, bit in enumerate(ind) if bit == 1]
-            if self._strict and self._predef_features is not None:
-                selected_features = list(set(selected_features) | set(self._predef_features))
-
-            # Assign scores
-            selected_scores = []
-            for feat in selected_features:
-                if self._predef_scores is not None and self._predef_features is not None and feat in self._predef_features:
-                    idx = list(self._predef_features).index(feat)
-                    selected_scores.append(self._predef_scores[idx])
-                else:
-                    if len(self.score_set_) == 0:
-                        raise ValueError("Score set is empty during Pareto front processing.")
-                    selected_scores.append(np.random.choice(list(self.score_set_)))
-
-            # Fit classifier
-            clf = ProbabilisticScoringSystem(
-                features=selected_features,
-                scores=selected_scores,
-                initial_feature_thresholds=[None] * len(selected_features),
-                **self.stage_clf_params_,
-            ).fit(X, y)
-            loss = clf.score(X, y)
-            cost = self.feature_costs[selected_features].sum()
+            selected_features = ind.selected_features_
+            selected_scores = ind.selected_scores_
+            loss = ind.loss_
+            cost = ind.cost_
+            clf = ind.classifier_
 
             solution = {
                 'features': selected_features,
@@ -292,10 +278,7 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
 
     def _compute_pareto_front(self, solutions):
         """
-        Computes the Pareto front from a list of solutions using non-dominated sorting.
-
-        :param solutions: List of solution dictionaries.
-        :return: List of non-dominated solutions.
+        Non-dominated sorting to compute Pareto front from solution dicts.
         """
         pareto_front = []
         for s in solutions:
@@ -303,64 +286,12 @@ class EvolutionCostSensitiveProbabilisticScoringList(ProbabilisticScoringList):
             for other_s in solutions:
                 if other_s == s:
                     continue
+                # If other_s is strictly better (or equal) in both objectives 
+                # and strictly better in at least one, s is dominated
                 if (other_s['loss'] <= s['loss'] and other_s['cost'] <= s['cost']) and \
                    (other_s['loss'] < s['loss'] or other_s['cost'] < s['cost']):
-                    # s is dominated by other_s
                     dominated = True
                     break
             if not dominated:
                 pareto_front.append(s)
         return pareto_front
-
-
-def eval_individual(
-    individual,
-    X,
-    y,
-    feature_costs,
-    predef_features,
-    predef_scores,
-    strict,
-    score_set,
-    stage_clf_params,
-):
-    """
-    Evaluates an individual in the evolutionary algorithm.
-
-    :param individual: The individual to evaluate.
-    :param X: Feature matrix.
-    :param y: Target vector.
-    :param feature_costs: Costs associated with each feature.
-    :param predef_features: Predefined features to include.
-    :param predef_scores: Predefined scores corresponding to the predefined features.
-    :param strict: Whether to strictly use the predefined features.
-    :param score_set: Set of possible scores.
-    :param stage_clf_params: Parameters for the stage classifiers.
-    :return: A tuple containing the loss and cost.
-    """
-    selected_features = [i for i, bit in enumerate(individual) if bit == 1]
-    if strict and predef_features is not None:
-        selected_features = list(set(selected_features) | set(predef_features))
-
-    # Assign scores
-    selected_scores = []
-    for feat in selected_features:
-        if predef_scores is not None and predef_features is not None and feat in predef_features:
-            idx = list(predef_features).index(feat)
-            selected_scores.append(predef_scores[idx])
-        else:
-            if len(score_set) == 0:
-                raise ValueError("Score set is empty during evaluation.")
-            selected_scores.append(np.random.choice(list(score_set)))
-
-    # Fit classifier
-    clf = ProbabilisticScoringSystem(
-        features=selected_features,
-        scores=selected_scores,
-        initial_feature_thresholds=[None] * len(selected_features),
-        **stage_clf_params,
-    ).fit(X, y)
-    loss = clf.score(X, y)
-    cost = feature_costs[selected_features].sum()
-
-    return loss, cost
